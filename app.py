@@ -1,76 +1,111 @@
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import *
-
+from linebot.models import TextSendMessage, MessageEvent, TextMessage
 import openai
 import os
 import traceback
+from dotenv import load_dotenv
 
+# 讀取 .env 檔案
+load_dotenv()
+
+# ---------------------------------------------
+# 初始化 Flask
+# ---------------------------------------------
 app = Flask(__name__)
 
-# LINE Bot 設定
-line_bot_api = LineBotApi(os.getenv('CHANNEL_ACCESS_TOKEN'))
-handler = WebhookHandler(os.getenv('CHANNEL_SECRET'))
+# ---------------------------------------------
+# 1) LINE Bot 設定
+# ---------------------------------------------
+CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 
-# DeepSeek 設定
-openai.api_key = os.getenv("OPENAI_API_KEY")
-openai.api_base = os.getenv("OPENAI_API_BASE")  # 如：https://api.deepseek.com/v1
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    raise ValueError("請設定 CHANNEL_ACCESS_TOKEN 與 CHANNEL_SECRET 環境變數")
 
-# 呼叫 DeepSeek Chat 模型
-def GPT_response(text):
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+# ---------------------------------------------
+# 2) DeepSeek 設定
+# ---------------------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.deepseek.com/v1")  # DeepSeek 服務
+
+if not OPENAI_API_KEY:
+    raise ValueError("請設定 OPENAI_API_KEY 環境變數")
+
+openai.api_key = OPENAI_API_KEY
+openai.api_base = OPENAI_API_BASE
+
+# ---------------------------------------------
+# 3) DeepSeek API 呼叫函式
+# ---------------------------------------------
+def GPT_response(user_text: str) -> str:
+    """呼叫 DeepSeek API 並回傳回答"""
     try:
+        print("[DEBUG] Sending to DeepSeek:", user_text)
+        
+        # 呼叫 DeepSeek API
         response = openai.ChatCompletion.create(
-            model="deepseek-chat",
-            messages=[{"role": "user", "content": text}],
+            model="deepseek-chat",  # 使用 DeepSeek Chat 模型
+            messages=[{"role": "user", "content": user_text}],
             temperature=0.5,
             max_tokens=500
         )
+        
+        print("[DEBUG] Raw response:", response)
         answer = response['choices'][0]['message']['content'].strip()
         return answer
     except Exception as e:
-        print(traceback.format_exc())
+        print("[ERROR] GPT_response Exception:\n", traceback.format_exc())
         return "抱歉，目前無法處理您的請求。"
 
-# LINE Webhook
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
+# ---------------------------------------------
+# 4) Flask Webhook 入口
+# ---------------------------------------------
+@app.route("/callback", methods=["POST"])
+def callback() -> str:
+    """LINE 官方會把訊息 POST 到這裡"""
+    signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    app.logger.info("Request body: %s", body)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
+        app.logger.error("Invalid Signature Error")
         abort(400)
-    return 'OK'
+    except Exception as e:
+        app.logger.error(f"General Error: {str(e)}")
+        abort(400)
 
-# 使用者傳送文字訊息時觸發
+    return "OK"
+
+# ---------------------------------------------
+# 5) LINE 文字訊息事件
+# ---------------------------------------------
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    msg = event.message.text
+def handle_text_message(event: MessageEvent) -> None:
+    user_msg = event.message.text
+    print("[LINE] User message:", user_msg)
+
+    answer = GPT_response(user_msg)
+    print("[LINE] GPT answer:", answer)
+
     try:
-        GPT_answer = GPT_response(msg)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(GPT_answer))
-    except:
-        print(traceback.format_exc())
-        line_bot_api.reply_message(event.reply_token, TextSendMessage("系統錯誤，請稍後再試"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=answer))
+    except Exception:
+        print("[ERROR] Reply Exception:\n", traceback.format_exc())
 
-# 點擊 postback 時觸發
-@handler.add(PostbackEvent)
-def handle_postback(event):
-    print("Postback data:", event.postback.data)
-
-# 群組新成員加入時觸發
-@handler.add(MemberJoinedEvent)
-def welcome(event):
-    uid = event.joined.members[0].user_id
-    gid = event.source.group_id
-    profile = line_bot_api.get_group_member_profile(gid, uid)
-    name = profile.display_name
-    message = TextSendMessage(text=f'{name} 歡迎加入本群組！')
-    line_bot_api.reply_message(event.reply_token, message)
-
-# 啟動伺服器
+# ---------------------------------------------
+# 6) 主程式入口
+# ---------------------------------------------
 if __name__ == "__main__":
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get("PORT", 5000))
+    print(f"[INFO] Starting app on port {port} ...")
+    print("LINE Access Token:", CHANNEL_ACCESS_TOKEN[:10] + "..." if CHANNEL_ACCESS_TOKEN else "None")
+    print("OpenAI Base URL:", openai.api_base)
     app.run(host="0.0.0.0", port=port)
+    
